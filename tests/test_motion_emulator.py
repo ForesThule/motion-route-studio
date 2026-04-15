@@ -116,11 +116,12 @@ class MotionEmulatorTests(unittest.TestCase):
         self.assertEqual(timing.mode, "speed-profile")
 
     def test_build_web_ui_html_contains_core_controls(self) -> None:
-        html = build_web_ui_html()
+        html = build_web_ui_html("test-session")
         self.assertIn("Motion Route Studio", html)
         self.assertIn("advancedSpeedDetails", html)
         self.assertIn("summaryPointsValue", html)
         self.assertIn("fitRouteButton", html)
+        self.assertIn("session-heartbeat", html)
 
 
 if __name__ == "__main__":

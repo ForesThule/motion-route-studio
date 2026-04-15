@@ -1,6 +1,6 @@
 # Motion Route Studio
 
-[![CI](https://github.com/ForesThule/emulator-move-simulator/actions/workflows/ci.yml/badge.svg)](https://github.com/ForesThule/emulator-move-simulator/actions/workflows/ci.yml)
+[![CI](https://github.com/ForesThule/motion-route-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/ForesThule/motion-route-studio/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-0f172a.svg)](./LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-b55434.svg)](https://www.python.org/)
 
@@ -56,18 +56,31 @@ Show available curves:
 python3 android_motion_emulator.py --list-curves
 ```
 
-Launch the local UI:
+Launch the local UI with the bash launcher:
 
 ```bash
-python3 android_motion_emulator.py --gui
+./scripts/run-ui.sh
 ```
+
+This launcher:
+
+- starts the local server
+- opens the web UI automatically
+- waits for the server process
+- cleans up the child process on exit
 
 By default the UI is available at `http://127.0.0.1:8765`.
 
 If the port is busy:
 
 ```bash
-python3 android_motion_emulator.py --gui --port 8877
+./scripts/run-ui.sh --port 8877
+```
+
+Run the CLI through bash as well:
+
+```bash
+./scripts/run-cli.sh --list-curves
 ```
 
 ## UI Workflow
@@ -211,6 +224,7 @@ Or use the convenience targets:
 ```bash
 make check
 make test
+make ui
 ```
 
 ## Repository Layout
@@ -218,6 +232,7 @@ make test
 ```text
 .
 ├── android_motion_emulator.py
+├── scripts/
 ├── tests/
 ├── .github/
 ├── README.md

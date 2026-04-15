@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
 from urllib.parse import parse_qs, urlsplit
@@ -21,6 +22,8 @@ DEFAULT_STOP_SHARE = 0.2
 DEFAULT_TIMING_MODE = "duration"
 DEFAULT_SPEED_KMH = 36.0
 PLATFORMS = ("android", "ios")
+UI_HEARTBEAT_INTERVAL_SECONDS = 2.0
+UI_SESSION_TIMEOUT_SECONDS = 12.0
 
 
 @dataclass(frozen=True)
@@ -1370,6 +1373,24 @@ class MotionWebState:
         self.logs: list[str] = []
         self.worker_thread: threading.Thread | None = None
         self.stop_event = threading.Event()
+        self.ui_session_id: str | None = None
+        self.last_session_seen = 0.0
+        self.auto_shutdown_on_idle = False
+        self.shutdown_requested = False
+        self.shutdown_callback: Callable[[], None] | None = None
+
+    def configure_ui_session(
+        self,
+        session_id: str,
+        shutdown_callback: Callable[[], None],
+        auto_shutdown_on_idle: bool,
+    ) -> None:
+        with self.lock:
+            self.ui_session_id = session_id
+            self.last_session_seen = time.monotonic()
+            self.auto_shutdown_on_idle = auto_shutdown_on_idle
+            self.shutdown_callback = shutdown_callback
+            self.shutdown_requested = False
 
     def is_running(self) -> bool:
         with self.lock:
@@ -1389,6 +1410,49 @@ class MotionWebState:
             next_cursor = len(self.logs)
             running = self.worker_thread is not None and self.worker_thread.is_alive()
         return logs, next_cursor, running
+
+    def touch_ui_session(self, session_id: str) -> None:
+        with self.lock:
+            if self.ui_session_id and session_id != self.ui_session_id:
+                raise ValueError("Unknown UI session.")
+            self.last_session_seen = time.monotonic()
+
+    def ui_heartbeat(self, payload: dict[str, object]) -> dict[str, object]:
+        session_id = str(payload.get("sessionId") or "").strip()
+        if not session_id:
+            raise ValueError("sessionId is required.")
+        self.touch_ui_session(session_id)
+        return {"ok": True, "running": self.is_running()}
+
+    def monitor_ui_session(self) -> None:
+        with self.lock:
+            session_id = self.ui_session_id
+            last_seen = self.last_session_seen
+            auto_shutdown_on_idle = self.auto_shutdown_on_idle
+            shutdown_requested = self.shutdown_requested
+
+        if not session_id or not auto_shutdown_on_idle or shutdown_requested:
+            return
+        if time.monotonic() - last_seen < UI_SESSION_TIMEOUT_SECONDS:
+            return
+
+        self.request_shutdown("No active UI window detected. Shutting down server.")
+
+    def request_shutdown(self, reason: str) -> None:
+        with self.lock:
+            if self.shutdown_requested:
+                return
+            self.shutdown_requested = True
+            running = self.worker_thread is not None and self.worker_thread.is_alive()
+            shutdown_callback = self.shutdown_callback
+
+        if running:
+            self.stop_event.set()
+            self.append_log("Stop requested because the UI session ended.")
+        self.append_log(reason)
+
+        if shutdown_callback is not None:
+            threading.Thread(target=shutdown_callback, daemon=True).start()
 
     def preview(self, payload: dict[str, object]) -> dict[str, object]:
         (
@@ -1510,6 +1574,11 @@ class MotionWebState:
                     )
                 if not self.stop_event.is_set():
                     self.append_log("Motion finished.")
+            except subprocess.CalledProcessError as exc:
+                self.append_log(f"Target command failed with code {exc.returncode}: {exc.cmd}")
+                self.append_log(
+                    "Motion stopped because the target emulator or simulator became unavailable."
+                )
             except Exception as exc:
                 self.append_log(f"Error: {exc}")
             finally:
@@ -1531,7 +1600,7 @@ class MotionWebState:
         return {"stopping": running, "running": running}
 
 
-def build_web_ui_html() -> str:
+def build_web_ui_html(session_id: str) -> str:
     curves = sorted(CURVES.keys())
     config = {
         "curves": curves,
@@ -1558,6 +1627,10 @@ def build_web_ui_html() -> str:
             "stopCurve": "ease-out",
             "startShare": DEFAULT_START_SHARE,
             "stopShare": DEFAULT_STOP_SHARE,
+        },
+        "runtime": {
+            "sessionId": session_id,
+            "heartbeatIntervalMs": int(UI_HEARTBEAT_INTERVAL_SECONDS * 1000),
         },
     }
     return f"""<!doctype html>
@@ -2300,9 +2373,12 @@ def build_web_ui_html() -> str:
     let selectedIndex = 0;
     let logCursor = 0;
     let pollTimer = null;
+    let heartbeatTimer = null;
     let map = null;
     let markers = [];
     let routePolyline = null;
+    const uiSessionId = CONFIG.runtime.sessionId;
+    const heartbeatIntervalMs = CONFIG.runtime.heartbeatIntervalMs;
 
     const pointsList = document.getElementById('pointsList');
     const latInput = document.getElementById('latInput');
@@ -2711,6 +2787,29 @@ def build_web_ui_html() -> str:
       return data;
     }}
 
+    async function sendUiHeartbeat() {{
+      try {{
+        await postJson('/api/session-heartbeat', {{ sessionId: uiSessionId }});
+      }} catch (_error) {{
+      }}
+    }}
+
+    function startUiHeartbeat() {{
+      if (heartbeatTimer) {{
+        return;
+      }}
+      sendUiHeartbeat();
+      heartbeatTimer = setInterval(sendUiHeartbeat, heartbeatIntervalMs);
+    }}
+
+    function stopUiHeartbeat() {{
+      if (!heartbeatTimer) {{
+        return;
+      }}
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }}
+
     async function pollLogs() {{
       const response = await fetch(`/api/logs?since=${{logCursor}}`);
       const data = await response.json();
@@ -3111,11 +3210,21 @@ def build_web_ui_html() -> str:
       element.addEventListener('change', updateSummary);
     }});
 
+    document.addEventListener('visibilitychange', () => {{
+      if (document.visibilityState === 'visible') {{
+        sendUiHeartbeat();
+      }}
+    }});
+
+    window.addEventListener('pagehide', stopUiHeartbeat);
+    window.addEventListener('beforeunload', stopUiHeartbeat);
+
     fillDefaults();
     initializeMap();
     renderPoints(true);
     refreshEmulators();
     pollLogs();
+    startUiHeartbeat();
   </script>
 </body>
 </html>"""
@@ -3137,7 +3246,7 @@ class MotionRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             return
-        if parsed.path in {"/api/logs", "/api/devices"}:
+        if parsed.path in {"/api/logs", "/api/devices", "/api/session-heartbeat"}:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
@@ -3148,7 +3257,7 @@ class MotionRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
         if parsed.path == "/":
-            self._send_html(build_web_ui_html())
+            self._send_html(build_web_ui_html(self.server.state.ui_session_id or ""))  # type: ignore[attr-defined]
             return
         if parsed.path == "/api/logs":
             raw_since = parse_qs(parsed.query).get("since", ["0"])[0]
@@ -3182,6 +3291,9 @@ class MotionRequestHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/stop":
             self._handle_json_action(self.server.state.stop_run)  # type: ignore[attr-defined]
+            return
+        if self.path == "/api/session-heartbeat":
+            self._handle_json_action(self.server.state.ui_heartbeat)  # type: ignore[attr-defined]
             return
         self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -3243,15 +3355,29 @@ def launch_gui(port: int) -> int:
         print(f"Unable to start web UI on port {port}: {exc}", file=sys.stderr)
         return 1
 
+    session_id = uuid.uuid4().hex
+    state.configure_ui_session(
+        session_id=session_id,
+        shutdown_callback=server.shutdown,
+        auto_shutdown_on_idle=True,
+    )
+
+    def monitor_ui_session() -> None:
+        while not state.shutdown_requested:
+            time.sleep(1.0)
+            state.monitor_ui_session()
+
+    threading.Thread(target=monitor_ui_session, daemon=True).start()
+
     url = f"http://127.0.0.1:{port}"
     print(f"Web UI available at {url}")
-    print("Open this URL in your browser. Press Ctrl+C to stop the server.")
+    print("Use the bash launcher to open the browser automatically. Press Ctrl+C to stop the server.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping web UI...")
     finally:
-        state.stop_event.set()
+        state.request_shutdown("Server shutdown requested.")
         server.server_close()
     return 0
 
